@@ -1,1185 +1,1274 @@
 /*
- * ================================================
- * IP/端口转发工具 - 游戏服务器转发
- * 适用于: Minecraft基岩版(MCBE)等游戏
- * 支持: TCP 和 UDP 协议
- * 编译: g++ -std=c++17 -O2 -pthread forwarder.cpp -o forwarder
- * ================================================
+ * IP 转发程序 - 多玩家支持版本
+ * 用于游戏服务器转发 (MCBE等)
+ * 架构: Multiple Clients -> Mid-Server(54321) -> Target-Server(19132)
+ *
+ * 多玩家原理:
+ *   每个客户端IP:Port -> 独立的会话 -> 独立的socket到目标服务器
+ *   Client1 (192.168.1.10:12345) -> Session1 -> Target
+ *   Client2 (192.168.1.11:54321) -> Session2 -> Target
+ *   ...
  */
 
-#include "forwarder.hpp"
+#include <iostream>
+#include <string>
+#include <map>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <cstring>
 #include <csignal>
-#include <cstdlib>
-#include <algorithm>
+#include <memory>
 #include <iomanip>
 
-namespace PortForwarder
+// Linux 网络头文件
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+// ==================== 日志级别 ====================
+enum LogLevel
 {
+    LOG_DEBUG = 0,
+    LOG_INFO = 1,
+    LOG_WARN = 2,
+    LOG_ERROR = 3
+};
 
-    // ==================== 全局信号处理 ====================
-    static std::atomic<bool> g_shutdown_requested{false};
+LogLevel g_log_level = LOG_INFO;
 
-    void signalHandler(int signum)
+// ==================== 简易 JSON 解析器 ====================
+class JsonValue
+{
+public:
+    enum Type
     {
-        (void)signum;
-        g_shutdown_requested = true;
-        std::cout << "\n[信号] 收到退出信号，正在关闭...\n";
+        NUL,
+        BOOL,
+        NUMBER,
+        STRING,
+        ARRAY,
+        OBJECT
+    };
+
+    Type type = NUL;
+    bool bool_val = false;
+    double num_val = 0;
+    std::string str_val;
+    std::vector<JsonValue> arr_val;
+    std::map<std::string, JsonValue> obj_val;
+
+    JsonValue() : type(NUL) {}
+    JsonValue(bool v) : type(BOOL), bool_val(v) {}
+    JsonValue(double v) : type(NUMBER), num_val(v) {}
+    JsonValue(int v) : type(NUMBER), num_val(v) {}
+    JsonValue(const std::string &v) : type(STRING), str_val(v) {}
+    JsonValue(const char *v) : type(STRING), str_val(v) {}
+
+    bool as_bool(bool def = false) const
+    {
+        return type == BOOL ? bool_val : def;
     }
 
-    // ==================== Config 实现 ====================
-
-    bool Config::loadFromFile(const std::string &path)
+    int as_int(int def = 0) const
     {
-        std::ifstream file(path);
+        return type == NUMBER ? (int)num_val : def;
+    }
+
+    std::string as_string(const std::string &def = "") const
+    {
+        return type == STRING ? str_val : def;
+    }
+
+    const JsonValue &operator[](const std::string &key) const
+    {
+        static JsonValue null_val;
+        if (type != OBJECT)
+            return null_val;
+        auto it = obj_val.find(key);
+        return it != obj_val.end() ? it->second : null_val;
+    }
+
+    bool has(const std::string &key) const
+    {
+        return type == OBJECT && obj_val.find(key) != obj_val.end();
+    }
+};
+
+class JsonParser
+{
+public:
+    static JsonValue parse(const std::string &json)
+    {
+        size_t pos = 0;
+        return parse_value(json, pos);
+    }
+
+    static JsonValue parse_file(const std::string &filename)
+    {
+        std::ifstream file(filename);
         if (!file.is_open())
         {
-            return false;
+            throw std::runtime_error("无法打开文件: " + filename);
+        }
+        std::stringstream ss;
+        ss << file.rdbuf();
+        return parse(ss.str());
+    }
+
+private:
+    static void skip_ws(const std::string &s, size_t &p)
+    {
+        while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
+            p++;
+    }
+
+    static JsonValue parse_value(const std::string &s, size_t &p)
+    {
+        skip_ws(s, p);
+        if (p >= s.size())
+            return JsonValue();
+
+        char c = s[p];
+        if (c == '{')
+            return parse_object(s, p);
+        if (c == '[')
+            return parse_array(s, p);
+        if (c == '"')
+            return parse_string(s, p);
+        if (c == 't' || c == 'f')
+            return parse_bool(s, p);
+        if (c == 'n')
+        {
+            p += 4;
+            return JsonValue();
+        }
+        if (c == '-' || (c >= '0' && c <= '9'))
+            return parse_number(s, p);
+        return JsonValue();
+    }
+
+    static JsonValue parse_object(const std::string &s, size_t &p)
+    {
+        JsonValue obj;
+        obj.type = JsonValue::OBJECT;
+        p++;
+        skip_ws(s, p);
+        if (p < s.size() && s[p] == '}')
+        {
+            p++;
+            return obj;
         }
 
-        std::string line;
-        while (std::getline(file, line))
+        while (p < s.size())
         {
-            // 移除空白和注释
-            size_t comment_pos = line.find("//");
-            if (comment_pos != std::string::npos)
+            skip_ws(s, p);
+            if (s[p] != '"')
+                break;
+            std::string key = parse_string(s, p).str_val;
+            skip_ws(s, p);
+            if (p >= s.size() || s[p] != ':')
+                break;
+            p++;
+            obj.obj_val[key] = parse_value(s, p);
+            skip_ws(s, p);
+            if (p >= s.size())
+                break;
+            if (s[p] == '}')
             {
-                line = line.substr(0, comment_pos);
+                p++;
+                break;
             }
-
-            // 简单的JSON解析（键值对）
-            size_t colon_pos = line.find(':');
-            if (colon_pos == std::string::npos)
+            if (s[p] == ',')
+            {
+                p++;
                 continue;
-
-            std::string key = line.substr(0, colon_pos);
-            std::string value = line.substr(colon_pos + 1);
-
-            // 清理字符串
-            auto trim = [](std::string &s)
-            {
-                const char *ws = " \t\n\r\f\v\"{}[],";
-                s.erase(0, s.find_first_not_of(ws));
-                s.erase(s.find_last_not_of(ws) + 1);
-            };
-
-            trim(key);
-            trim(value);
-
-            // 解析各个字段
-            if (key == "listen_host")
-                listen_host = value;
-            else if (key == "listen_port")
-                listen_port = std::stoi(value);
-            else if (key == "target_host")
-                target_host = value;
-            else if (key == "target_port")
-                target_port = std::stoi(value);
-            else if (key == "enable_tcp")
-                enable_tcp = (value == "true");
-            else if (key == "enable_udp")
-                enable_udp = (value == "true");
-            else if (key == "buffer_size")
-                buffer_size = std::stoull(value);
-            else if (key == "udp_timeout")
-                udp_timeout = std::stoi(value);
-            else if (key == "log_level")
-            {
-                if (value == "DEBUG")
-                    log_level = LogLevel::DEBUG;
-                else if (value == "INFO")
-                    log_level = LogLevel::INFO;
-                else if (value == "WARNING")
-                    log_level = LogLevel::WARNING;
-                else if (value == "ERROR")
-                    log_level = LogLevel::ERROR;
             }
+            break;
         }
-
-        return true;
+        return obj;
     }
 
-    bool Config::saveToFile(const std::string &path) const
+    static JsonValue parse_array(const std::string &s, size_t &p)
     {
-        std::ofstream file(path);
-        if (!file.is_open())
+        JsonValue arr;
+        arr.type = JsonValue::ARRAY;
+        p++;
+        skip_ws(s, p);
+        if (p < s.size() && s[p] == ']')
         {
+            p++;
+            return arr;
+        }
+
+        while (p < s.size())
+        {
+            arr.arr_val.push_back(parse_value(s, p));
+            skip_ws(s, p);
+            if (p >= s.size())
+                break;
+            if (s[p] == ']')
+            {
+                p++;
+                break;
+            }
+            if (s[p] == ',')
+            {
+                p++;
+                continue;
+            }
+            break;
+        }
+        return arr;
+    }
+
+    static JsonValue parse_string(const std::string &s, size_t &p)
+    {
+        p++;
+        std::string r;
+        while (p < s.size() && s[p] != '"')
+        {
+            if (s[p] == '\\' && p + 1 < s.size())
+            {
+                p++;
+                switch (s[p])
+                {
+                case 'n':
+                    r += '\n';
+                    break;
+                case 't':
+                    r += '\t';
+                    break;
+                case 'r':
+                    r += '\r';
+                    break;
+                default:
+                    r += s[p];
+                    break;
+                }
+            }
+            else
+            {
+                r += s[p];
+            }
+            p++;
+        }
+        if (p < s.size())
+            p++;
+        return JsonValue(r);
+    }
+
+    static JsonValue parse_number(const std::string &s, size_t &p)
+    {
+        size_t start = p;
+        if (s[p] == '-')
+            p++;
+        while (p < s.size() && s[p] >= '0' && s[p] <= '9')
+            p++;
+        if (p < s.size() && s[p] == '.')
+        {
+            p++;
+            while (p < s.size() && s[p] >= '0' && s[p] <= '9')
+                p++;
+        }
+        return JsonValue(std::stod(s.substr(start, p - start)));
+    }
+
+    static JsonValue parse_bool(const std::string &s, size_t &p)
+    {
+        if (s.substr(p, 4) == "true")
+        {
+            p += 4;
+            return JsonValue(true);
+        }
+        if (s.substr(p, 5) == "false")
+        {
+            p += 5;
+            return JsonValue(false);
+        }
+        return JsonValue();
+    }
+};
+
+// ==================== 配置类 ====================
+struct Config
+{
+    std::string listen_host = "0.0.0.0";
+    int listen_port = 54321;
+    std::string target_host = "127.0.0.1";
+    int target_port = 19132;
+    bool enable_tcp = false;
+    bool enable_udp = true;
+    int buffer_size = 65535;
+    int udp_timeout = 120;
+    std::string log_level = "INFO";
+
+    bool load(const std::string &filename)
+    {
+        try
+        {
+            JsonValue json = JsonParser::parse_file(filename);
+
+            listen_host = json["listen_host"].as_string(listen_host);
+            listen_port = json["listen_port"].as_int(listen_port);
+            target_host = json["target_host"].as_string(target_host);
+            target_port = json["target_port"].as_int(target_port);
+            enable_tcp = json["enable_tcp"].as_bool(enable_tcp);
+            enable_udp = json["enable_udp"].as_bool(enable_udp);
+            buffer_size = json["buffer_size"].as_int(buffer_size);
+            udp_timeout = json["udp_timeout"].as_int(udp_timeout);
+            log_level = json["log_level"].as_string(log_level);
+
+            // 设置日志级别
+            if (log_level == "DEBUG")
+                g_log_level = LOG_DEBUG;
+            else if (log_level == "INFO")
+                g_log_level = LOG_INFO;
+            else if (log_level == "WARN")
+                g_log_level = LOG_WARN;
+            else if (log_level == "ERROR")
+                g_log_level = LOG_ERROR;
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[错误] 解析配置失败: " << e.what() << std::endl;
             return false;
         }
-
-        file << "{\n";
-        file << "    \"listen_host\": \"" << listen_host << "\",\n";
-        file << "    \"listen_port\": " << listen_port << ",\n";
-        file << "    \"target_host\": \"" << target_host << "\",\n";
-        file << "    \"target_port\": " << target_port << ",\n";
-        file << "    \"enable_tcp\": " << (enable_tcp ? "true" : "false") << ",\n";
-        file << "    \"enable_udp\": " << (enable_udp ? "true" : "false") << ",\n";
-        file << "    \"buffer_size\": " << buffer_size << ",\n";
-        file << "    \"udp_timeout\": " << udp_timeout << ",\n";
-
-        std::string level_str;
-        switch (log_level)
-        {
-        case LogLevel::DEBUG:
-            level_str = "DEBUG";
-            break;
-        case LogLevel::INFO:
-            level_str = "INFO";
-            break;
-        case LogLevel::WARNING:
-            level_str = "WARNING";
-            break;
-        case LogLevel::ERROR:
-            level_str = "ERROR";
-            break;
-        }
-        file << "    \"log_level\": \"" << level_str << "\"\n";
-        file << "}\n";
-
-        return true;
     }
 
-    void Config::print() const
+    void create_default(const std::string &filename)
     {
-        auto &log = Logger::instance();
-        log.info("CONFIG", "══════════════════════════════════════════");
-        log.info("CONFIG", "当前配置:");
-        log.info("CONFIG", "  监听地址: " + listen_host + ":" + std::to_string(listen_port));
-        log.info("CONFIG", "  目标地址: " + target_host + ":" + std::to_string(target_port));
-        log.info("CONFIG", "  TCP转发: " + std::string(enable_tcp ? "启用" : "禁用"));
-        log.info("CONFIG", "  UDP转发: " + std::string(enable_udp ? "启用" : "禁用"));
-        log.info("CONFIG", "  缓冲区大小: " + std::to_string(buffer_size) + " 字节");
-        log.info("CONFIG", "  UDP超时: " + std::to_string(udp_timeout) + " 秒");
-        log.info("CONFIG", "══════════════════════════════════════════");
+        std::ofstream file(filename);
+        file << R"({
+    "listen_host": "0.0.0.0",
+    "listen_port": 54321,
+    "target_host": "127.0.0.1",
+    "target_port": 19132,
+    "enable_tcp": false,
+    "enable_udp": true,
+    "buffer_size": 65535,
+    "udp_timeout": 120,
+    "log_level": "INFO"
+})";
+        file.close();
     }
 
-    // ==================== Logger 实现 ====================
-
-    Logger &Logger::instance()
+    void print()
     {
-        static Logger instance;
-        return instance;
+        std::cout << "\n";
+        std::cout << "╔══════════════════════════════════════════════╗\n";
+        std::cout << "║              配 置 信 息                     ║\n";
+        std::cout << "╠══════════════════════════════════════════════╣\n";
+        std::cout << "║ 监听地址: " << std::left << std::setw(34)
+                  << (listen_host + ":" + std::to_string(listen_port)) << "║\n";
+        std::cout << "║ 目标地址: " << std::left << std::setw(34)
+                  << (target_host + ":" + std::to_string(target_port)) << "║\n";
+        std::cout << "║ UDP转发:  " << std::left << std::setw(34)
+                  << (enable_udp ? "开启" : "关闭") << "║\n";
+        std::cout << "║ TCP转发:  " << std::left << std::setw(34)
+                  << (enable_tcp ? "开启" : "关闭") << "║\n";
+        std::cout << "║ 缓冲区:   " << std::left << std::setw(34)
+                  << (std::to_string(buffer_size) + " bytes") << "║\n";
+        std::cout << "║ UDP超时:  " << std::left << std::setw(34)
+                  << (std::to_string(udp_timeout) + " 秒") << "║\n";
+        std::cout << "║ 日志级别: " << std::left << std::setw(34)
+                  << log_level << "║\n";
+        std::cout << "╚══════════════════════════════════════════════╝\n";
     }
+};
 
-    void Logger::setLevel(LogLevel level)
-    {
-        m_level = level;
-    }
+// ==================== 全局变量 ====================
+Config g_config;
+std::atomic<bool> g_running(true);
+std::atomic<int> g_udp_sessions(0);
+std::atomic<int> g_tcp_connections(0);
+std::atomic<uint64_t> g_packets_in(0);
+std::atomic<uint64_t> g_packets_out(0);
+std::atomic<uint64_t> g_bytes_in(0);
+std::atomic<uint64_t> g_bytes_out(0);
 
-    std::string Logger::getTimestamp()
+// ==================== 日志类 ====================
+class Log
+{
+public:
+    static std::string timestamp()
     {
         auto now = std::chrono::system_clock::now();
-        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        auto time = std::chrono::system_clock::to_time_t(now);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       now.time_since_epoch()) %
                   1000;
 
-        std::tm tm_now;
-#ifdef PLATFORM_WINDOWS
-        localtime_s(&tm_now, &time_t_now);
-#else
-        localtime_r(&time_t_now, &tm_now);
-#endif
+        char buf[32];
+        strftime(buf, sizeof(buf), "%H:%M:%S", localtime(&time));
 
-        std::ostringstream oss;
-        oss << std::put_time(&tm_now, "%H:%M:%S");
-        oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-        return oss.str();
+        std::stringstream ss;
+        ss << buf << "." << std::setfill('0') << std::setw(3) << ms.count();
+        return ss.str();
     }
 
-    std::string Logger::getLevelString(LogLevel level)
+    static void debug(const std::string &msg)
     {
-        switch (level)
-        {
-        case LogLevel::DEBUG:
-            return "\033[36mDEBUG\033[0m  ";
-        case LogLevel::INFO:
-            return "\033[32mINFO\033[0m   ";
-        case LogLevel::WARNING:
-            return "\033[33mWARN\033[0m   ";
-        case LogLevel::ERROR:
-            return "\033[31mERROR\033[0m  ";
-        default:
-            return "UNKN   ";
-        }
+        if (g_log_level <= LOG_DEBUG)
+            std::cout << timestamp() << " [DEBUG] " << msg << std::endl;
     }
 
-    void Logger::log(LogLevel level, const std::string &tag, const std::string &message)
+    static void info(const std::string &msg)
     {
-        if (level < m_level)
-            return;
-
-        std::lock_guard<std::mutex> lock(m_mutex);
-        std::cout << getTimestamp() << " │ "
-                  << getLevelString(level) << " │ "
-                  << "[" << tag << "] " << message << std::endl;
+        if (g_log_level <= LOG_INFO)
+            std::cout << timestamp() << " [INFO]  " << msg << std::endl;
     }
 
-    void Logger::debug(const std::string &tag, const std::string &msg)
+    static void warn(const std::string &msg)
     {
-        log(LogLevel::DEBUG, tag, msg);
+        if (g_log_level <= LOG_WARN)
+            std::cout << timestamp() << " [WARN]  " << msg << std::endl;
     }
 
-    void Logger::info(const std::string &tag, const std::string &msg)
+    static void error(const std::string &msg)
     {
-        log(LogLevel::INFO, tag, msg);
+        if (g_log_level <= LOG_ERROR)
+            std::cerr << timestamp() << " [ERROR] " << msg << std::endl;
     }
+};
 
-    void Logger::warning(const std::string &tag, const std::string &msg)
+// ==================== 工具函数 ====================
+void set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+std::string addr_to_string(const sockaddr_in &addr)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s:%d",
+             inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+    return std::string(buf);
+}
+
+std::string format_bytes(uint64_t bytes)
+{
+    const char *units[] = {"B", "KB", "MB", "GB"};
+    int unit = 0;
+    double size = bytes;
+    while (size >= 1024 && unit < 3)
     {
-        log(LogLevel::WARNING, tag, msg);
+        size /= 1024;
+        unit++;
     }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f %s", size, units[unit]);
+    return std::string(buf);
+}
 
-    void Logger::error(const std::string &tag, const std::string &msg)
+// 解析主机名到IP
+bool resolve_host(const std::string &host, sockaddr_in &addr)
+{
+    // 先尝试直接解析IP
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) == 1)
     {
-        log(LogLevel::ERROR, tag, msg);
-    }
-
-    // ==================== NetworkUtils 实现 ====================
-
-    bool NetworkUtils::initialize()
-    {
-#ifdef PLATFORM_WINDOWS
-        WSADATA wsaData;
-        int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (result != 0)
-        {
-            Logger::instance().error("NET", "WSAStartup 失败: " + std::to_string(result));
-            return false;
-        }
-#else
-        // 忽略SIGPIPE信号
-        signal(SIGPIPE, SIG_IGN);
-#endif
         return true;
     }
 
-    void NetworkUtils::cleanup()
+    // DNS解析
+    struct hostent *he = gethostbyname(host.c_str());
+    if (he && he->h_addr_list[0])
     {
-#ifdef PLATFORM_WINDOWS
-        WSACleanup();
-#endif
+        memcpy(&addr.sin_addr, he->h_addr_list[0], sizeof(addr.sin_addr));
+        return true;
     }
 
-    socket_t NetworkUtils::createSocket(int type)
+    return false;
+}
+
+void signal_handler(int sig)
+{
+    (void)sig;
+    std::cout << "\n";
+    Log::info("收到退出信号，正在关闭...");
+    g_running = false;
+}
+
+// ==================== UDP 会话 (每个玩家一个) ====================
+struct UdpSession
+{
+    int server_socket;       // 到目标服务器的socket
+    sockaddr_in client_addr; // 客户端地址
+    std::chrono::steady_clock::time_point last_active;
+    uint64_t packets_sent = 0;
+    uint64_t packets_recv = 0;
+
+    UdpSession() : server_socket(-1)
     {
-        socket_t sock = socket(AF_INET, type, 0);
-        if (sock == INVALID_SOCK)
+        memset(&client_addr, 0, sizeof(client_addr));
+        last_active = std::chrono::steady_clock::now();
+    }
+
+    ~UdpSession()
+    {
+        if (server_socket >= 0)
         {
-            Logger::instance().error("NET", "创建socket失败: " + getErrorString());
+            close(server_socket);
         }
-        return sock;
     }
 
-    bool NetworkUtils::setNonBlocking(socket_t sock, bool nonBlocking)
+    void update_activity()
     {
-#ifdef PLATFORM_WINDOWS
-        u_long mode = nonBlocking ? 1 : 0;
-        return ioctlsocket(sock, FIONBIO, &mode) == 0;
-#else
-        int flags = fcntl(sock, F_GETFL, 0);
-        if (flags == -1)
+        last_active = std::chrono::steady_clock::now();
+    }
+
+    int inactive_seconds() const
+    {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   now - last_active)
+            .count();
+    }
+};
+
+// ==================== UDP 转发器 (多玩家支持) ====================
+class UdpForwarder
+{
+public:
+    UdpForwarder() : listen_socket_(-1), running_(false) {}
+
+    ~UdpForwarder() { stop(); }
+
+    bool start()
+    {
+        // 创建监听socket
+        listen_socket_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (listen_socket_ < 0)
+        {
+            Log::error("UDP: 创建socket失败 - " + std::string(strerror(errno)));
             return false;
-
-        if (nonBlocking)
-        {
-            flags |= O_NONBLOCK;
         }
-        else
-        {
-            flags &= ~O_NONBLOCK;
-        }
-        return fcntl(sock, F_SETFL, flags) == 0;
-#endif
-    }
 
-    bool NetworkUtils::setReuseAddr(socket_t sock)
-    {
+        // 设置socket选项
         int opt = 1;
-        return setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
-                          reinterpret_cast<const char *>(&opt), sizeof(opt)) == 0;
-    }
+        setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    bool NetworkUtils::setBufferSize(socket_t sock, int size)
-    {
-        bool success = true;
-        success &= setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
-                              reinterpret_cast<const char *>(&size), sizeof(size)) == 0;
-        success &= setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
-                              reinterpret_cast<const char *>(&size), sizeof(size)) == 0;
-        return success;
-    }
-
-    bool NetworkUtils::setTimeout(socket_t sock, int seconds)
-    {
-#ifdef PLATFORM_WINDOWS
-        DWORD timeout = seconds * 1000;
-        return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                          reinterpret_cast<const char *>(&timeout), sizeof(timeout)) == 0;
-#else
-        struct timeval tv;
-        tv.tv_sec = seconds;
-        tv.tv_usec = 0;
-        return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                          reinterpret_cast<const char *>(&tv), sizeof(tv)) == 0;
-#endif
-    }
-
-    void NetworkUtils::closeSocket(socket_t &sock)
-    {
-        if (sock != INVALID_SOCK)
-        {
-#ifdef PLATFORM_WINDOWS
-            shutdown(sock, SD_BOTH);
-#else
-            shutdown(sock, SHUT_RDWR);
-#endif
-            CLOSE_SOCKET(sock);
-            sock = INVALID_SOCK;
-        }
-    }
-
-    std::string NetworkUtils::getErrorString()
-    {
-#ifdef PLATFORM_WINDOWS
-        int error = WSAGetLastError();
-        char *msg = nullptr;
-        FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-                       nullptr, error, 0, reinterpret_cast<LPSTR>(&msg), 0, nullptr);
-        std::string result = msg ? msg : "Unknown error";
-        LocalFree(msg);
-        return result;
-#else
-        return strerror(errno);
-#endif
-    }
-
-    std::string NetworkUtils::addressToString(const sockaddr_in &addr)
-    {
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
-        return std::string(ip) + ":" + std::to_string(ntohs(addr.sin_port));
-    }
-
-    // ==================== UDPSession 实现 ====================
-
-    UDPSession::~UDPSession()
-    {
-        running = false;
-        if (recv_thread.joinable())
-        {
-            recv_thread.join();
-        }
-        if (socket != INVALID_SOCK)
-        {
-            NetworkUtils::closeSocket(socket);
-        }
-    }
-
-    // ==================== TCPForwarder 实现 ====================
-
-    TCPForwarder::TCPForwarder(const Config &config)
-        : m_config(config), m_server_socket(INVALID_SOCK)
-    {
-    }
-
-    TCPForwarder::~TCPForwarder()
-    {
-        stop();
-    }
-
-    bool TCPForwarder::start()
-    {
-        auto &log = Logger::instance();
-
-        // 创建服务器socket
-        m_server_socket = NetworkUtils::createSocket(SOCK_STREAM);
-        if (m_server_socket == INVALID_SOCK)
-        {
-            return false;
-        }
-
-        NetworkUtils::setReuseAddr(m_server_socket);
+        int buf_size = g_config.buffer_size;
+        setsockopt(listen_socket_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+        setsockopt(listen_socket_, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
 
         // 绑定地址
-        sockaddr_in server_addr{};
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(m_config.listen_port);
-        inet_pton(AF_INET, m_config.listen_host.c_str(), &server_addr.sin_addr);
+        sockaddr_in listen_addr{};
+        listen_addr.sin_family = AF_INET;
+        listen_addr.sin_port = htons(g_config.listen_port);
 
-        if (bind(m_server_socket, reinterpret_cast<sockaddr *>(&server_addr),
-                 sizeof(server_addr)) < 0)
+        if (!resolve_host(g_config.listen_host, listen_addr))
         {
-            log.error("TCP", "绑定端口失败: " + NetworkUtils::getErrorString());
-            NetworkUtils::closeSocket(m_server_socket);
+            Log::error("UDP: 无法解析监听地址: " + g_config.listen_host);
+            close(listen_socket_);
             return false;
         }
 
-        // 开始监听
-        if (listen(m_server_socket, 100) < 0)
+        if (bind(listen_socket_, (sockaddr *)&listen_addr, sizeof(listen_addr)) < 0)
         {
-            log.error("TCP", "监听失败: " + NetworkUtils::getErrorString());
-            NetworkUtils::closeSocket(m_server_socket);
+            Log::error("UDP: 绑定失败 - " + std::string(strerror(errno)));
+            close(listen_socket_);
             return false;
         }
 
-        // 设置超时以便能够优雅退出
-        NetworkUtils::setTimeout(m_server_socket, 1);
+        // 解析目标地址
+        target_addr_.sin_family = AF_INET;
+        target_addr_.sin_port = htons(g_config.target_port);
+        if (!resolve_host(g_config.target_host, target_addr_))
+        {
+            Log::error("UDP: 无法解析目标地址: " + g_config.target_host);
+            close(listen_socket_);
+            return false;
+        }
 
-        m_running = true;
-        m_accept_thread = std::thread(&TCPForwarder::acceptLoop, this);
+        set_nonblocking(listen_socket_);
+        running_ = true;
 
-        log.info("TCP", "✓ 监听启动 " + m_config.listen_host + ":" +
-                            std::to_string(m_config.listen_port));
+        // 启动工作线程
+        forward_thread_ = std::thread(&UdpForwarder::forward_loop, this);
+        cleanup_thread_ = std::thread(&UdpForwarder::cleanup_loop, this);
+
+        Log::info("UDP: 转发器启动 " + g_config.listen_host + ":" +
+                  std::to_string(g_config.listen_port) + " -> " +
+                  g_config.target_host + ":" + std::to_string(g_config.target_port));
 
         return true;
     }
 
-    void TCPForwarder::stop()
+    void stop()
     {
-        m_running = false;
+        running_ = false;
 
-        NetworkUtils::closeSocket(m_server_socket);
-
-        if (m_accept_thread.joinable())
+        if (listen_socket_ >= 0)
         {
-            m_accept_thread.join();
+            close(listen_socket_);
+            listen_socket_ = -1;
         }
 
-        // 等待所有处理线程
-        std::lock_guard<std::mutex> lock(m_threads_mutex);
-        for (auto &t : m_handler_threads)
+        if (forward_thread_.joinable() &&
+            forward_thread_.get_id() != std::this_thread::get_id())
         {
-            if (t.joinable())
-            {
-                t.join();
-            }
+            forward_thread_.join();
         }
-        m_handler_threads.clear();
 
-        Logger::instance().info("TCP", "✗ 服务已停止");
+        if (cleanup_thread_.joinable() &&
+            cleanup_thread_.get_id() != std::this_thread::get_id())
+        {
+            cleanup_thread_.join();
+        }
+
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_.clear();
     }
 
-    void TCPForwarder::acceptLoop()
+    void print_sessions()
     {
-        auto &log = Logger::instance();
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
 
-        while (m_running && !g_shutdown_requested)
+        if (sessions_.empty())
         {
-            sockaddr_in client_addr{};
-            socklen_t client_len = sizeof(client_addr);
-
-            socket_t client_socket = accept(m_server_socket,
-                                            reinterpret_cast<sockaddr *>(&client_addr),
-                                            &client_len);
-
-            if (client_socket == INVALID_SOCK)
-            {
-                // 超时或错误
-                continue;
-            }
-
-            int conn_id = ++m_connection_count;
-            log.info("TCP", "新连接 #" + std::to_string(conn_id) +
-                                " 来自 " + NetworkUtils::addressToString(client_addr));
-
-            // 启动处理线程
-            std::lock_guard<std::mutex> lock(m_threads_mutex);
-            m_handler_threads.emplace_back(&TCPForwarder::handleConnection, this,
-                                           client_socket, client_addr, conn_id);
-        }
-    }
-
-    void TCPForwarder::handleConnection(socket_t client_socket, sockaddr_in client_addr, int conn_id)
-    {
-        auto &log = Logger::instance();
-        socket_t target_socket = INVALID_SOCK;
-
-        auto cleanup = [&]()
-        {
-            NetworkUtils::closeSocket(client_socket);
-            NetworkUtils::closeSocket(target_socket);
-            log.info("TCP", "#" + std::to_string(conn_id) + " 连接已关闭");
-        };
-
-        // 连接到目标服务器
-        target_socket = NetworkUtils::createSocket(SOCK_STREAM);
-        if (target_socket == INVALID_SOCK)
-        {
-            cleanup();
+            std::cout << "  (无活动会话)\n";
             return;
         }
 
-        sockaddr_in target_addr{};
-        target_addr.sin_family = AF_INET;
-        target_addr.sin_port = htons(m_config.target_port);
-        inet_pton(AF_INET, m_config.target_host.c_str(), &target_addr.sin_addr);
-
-        // 设置连接超时
-        NetworkUtils::setTimeout(target_socket, 10);
-
-        if (connect(target_socket, reinterpret_cast<sockaddr *>(&target_addr),
-                    sizeof(target_addr)) < 0)
+        for (const auto &pair : sessions_)
         {
-            log.warning("TCP", "#" + std::to_string(conn_id) + " 连接目标服务器失败");
-            cleanup();
-            return;
+            std::cout << "  " << pair.first
+                      << " | 发送: " << pair.second->packets_sent
+                      << " | 接收: " << pair.second->packets_recv
+                      << " | 空闲: " << pair.second->inactive_seconds() << "s\n";
         }
-
-        log.info("TCP", "#" + std::to_string(conn_id) + " 已连接到目标服务器");
-
-        // 重置超时
-        NetworkUtils::setTimeout(target_socket, 0);
-        NetworkUtils::setTimeout(client_socket, 0);
-
-        // 双向转发
-        std::atomic<bool> stop_flag{false};
-
-        std::thread t1(&TCPForwarder::forwardData, this, client_socket, target_socket,
-                       "#" + std::to_string(conn_id) + " C→S", std::ref(stop_flag));
-        std::thread t2(&TCPForwarder::forwardData, this, target_socket, client_socket,
-                       "#" + std::to_string(conn_id) + " S→C", std::ref(stop_flag));
-
-        t1.join();
-        t2.join();
-
-        cleanup();
     }
 
-    void TCPForwarder::forwardData(socket_t source, socket_t dest,
-                                   const std::string &direction, std::atomic<bool> &stop_flag)
+private:
+    int listen_socket_;
+    sockaddr_in target_addr_;
+    std::atomic<bool> running_;
+    std::thread forward_thread_;
+    std::thread cleanup_thread_;
+
+    std::mutex sessions_mutex_;
+    std::map<std::string, std::shared_ptr<UdpSession>> sessions_;
+
+    // 获取或创建会话
+    std::shared_ptr<UdpSession> get_or_create_session(const sockaddr_in &client_addr)
     {
-        auto &log = Logger::instance();
-        std::vector<char> buffer(m_config.buffer_size);
-        uint64_t total_bytes = 0;
+        std::string key = addr_to_string(client_addr);
 
-        // 设置读取超时
-        NetworkUtils::setTimeout(source, 1);
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
 
-        while (m_running && !stop_flag && !g_shutdown_requested)
+        auto it = sessions_.find(key);
+        if (it != sessions_.end())
         {
-            int received = recv(source, buffer.data(), buffer.size(), 0);
+            return it->second;
+        }
 
-            if (received > 0)
+        // 创建新会话
+        auto session = std::make_shared<UdpSession>();
+        session->client_addr = client_addr;
+
+        // 为此客户端创建独立的服务器socket
+        session->server_socket = socket(AF_INET, SOCK_DGRAM, 0);
+        if (session->server_socket < 0)
+        {
+            Log::error("UDP: 创建服务器socket失败");
+            return nullptr;
+        }
+
+        // 连接到目标服务器 (使UDP可以用recv/send)
+        if (connect(session->server_socket,
+                    (sockaddr *)&target_addr_, sizeof(target_addr_)) < 0)
+        {
+            Log::error("UDP: 连接目标服务器失败");
+            close(session->server_socket);
+            return nullptr;
+        }
+
+        set_nonblocking(session->server_socket);
+        sessions_[key] = session;
+        g_udp_sessions++;
+
+        Log::info("UDP: 新玩家连接 " + key + " (在线: " +
+                  std::to_string(sessions_.size()) + ")");
+
+        return session;
+    }
+
+    // 主转发循环
+    void forward_loop()
+    {
+        std::vector<char> buffer(g_config.buffer_size);
+
+        while (running_ && g_running)
+        {
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(listen_socket_, &read_fds);
+
+            int max_fd = listen_socket_;
+
+            // 收集所有会话的socket
+            std::vector<std::pair<std::string, std::shared_ptr<UdpSession>>> active_sessions;
             {
-                int sent = 0;
-                while (sent < received)
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                for (auto &pair : sessions_)
                 {
-                    int n = send(dest, buffer.data() + sent, received - sent, 0);
-                    if (n <= 0)
+                    if (pair.second->server_socket >= 0)
                     {
-                        stop_flag = true;
-                        break;
+                        FD_SET(pair.second->server_socket, &read_fds);
+                        max_fd = std::max(max_fd, pair.second->server_socket);
+                        active_sessions.push_back(pair);
                     }
-                    sent += n;
                 }
-                total_bytes += received;
             }
-            else if (received == 0)
+
+            timeval tv{0, 50000}; // 50ms超时
+            int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+
+            if (ret < 0)
             {
-                // 连接关闭
+                if (errno == EINTR)
+                    continue;
                 break;
             }
-            else
+            if (ret == 0)
+                continue;
+
+            // 1. 处理来自客户端的数据 -> 转发到服务器
+            if (FD_ISSET(listen_socket_, &read_fds))
             {
-                // 检查是否是超时
-#ifdef PLATFORM_WINDOWS
-                if (WSAGetLastError() == WSAETIMEDOUT)
-                    continue;
-#else
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    continue;
-#endif
-                break;
-            }
-        }
+                sockaddr_in client_addr{};
+                socklen_t addr_len = sizeof(client_addr);
 
-        stop_flag = true;
-        log.debug("TCP", direction + " 传输完成, 共 " + std::to_string(total_bytes) + " 字节");
-    }
+                ssize_t recv_len = recvfrom(listen_socket_, buffer.data(),
+                                            buffer.size(), 0,
+                                            (sockaddr *)&client_addr, &addr_len);
 
-    // ==================== UDPForwarder 实现 ====================
-
-    UDPForwarder::UDPForwarder(const Config &config)
-        : m_config(config), m_socket(INVALID_SOCK)
-    {
-    }
-
-    UDPForwarder::~UDPForwarder()
-    {
-        stop();
-    }
-
-    bool UDPForwarder::start()
-    {
-        auto &log = Logger::instance();
-
-        // 创建UDP socket
-        m_socket = NetworkUtils::createSocket(SOCK_DGRAM);
-        if (m_socket == INVALID_SOCK)
-        {
-            return false;
-        }
-
-        NetworkUtils::setReuseAddr(m_socket);
-        NetworkUtils::setBufferSize(m_socket, 1024 * 1024);
-        NetworkUtils::setTimeout(m_socket, 1);
-
-        // 绑定地址
-        sockaddr_in server_addr{};
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(m_config.listen_port);
-        inet_pton(AF_INET, m_config.listen_host.c_str(), &server_addr.sin_addr);
-
-        if (bind(m_socket, reinterpret_cast<sockaddr *>(&server_addr),
-                 sizeof(server_addr)) < 0)
-        {
-            log.error("UDP", "绑定端口失败: " + NetworkUtils::getErrorString());
-            NetworkUtils::closeSocket(m_socket);
-            return false;
-        }
-
-        m_running = true;
-
-        // 启动各个线程
-        m_recv_thread = std::thread(&UDPForwarder::receiveLoop, this);
-        m_cleanup_thread = std::thread(&UDPForwarder::cleanupSessions, this);
-        m_stats_thread = std::thread(&UDPForwarder::printStats, this);
-
-        log.info("UDP", "✓ 监听启动 " + m_config.listen_host + ":" +
-                            std::to_string(m_config.listen_port));
-
-        return true;
-    }
-
-    void UDPForwarder::stop()
-    {
-        m_running = false;
-
-        // 关闭所有会话
-        {
-            std::lock_guard<std::mutex> lock(m_sessions_mutex);
-            for (auto &pair : m_sessions)
-            {
-                pair.second->running = false;
-            }
-            m_sessions.clear();
-        }
-
-        NetworkUtils::closeSocket(m_socket);
-
-        if (m_recv_thread.joinable())
-            m_recv_thread.join();
-        if (m_cleanup_thread.joinable())
-            m_cleanup_thread.join();
-        if (m_stats_thread.joinable())
-            m_stats_thread.join();
-
-        Logger::instance().info("UDP", "✗ 服务已停止");
-    }
-
-    std::string UDPForwarder::makeClientKey(const sockaddr_in &addr)
-    {
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
-        return std::string(ip) + ":" + std::to_string(ntohs(addr.sin_port));
-    }
-
-    void UDPForwarder::receiveLoop()
-    {
-        auto &log = Logger::instance();
-        std::vector<char> buffer(m_config.buffer_size);
-
-        while (m_running && !g_shutdown_requested)
-        {
-            sockaddr_in client_addr{};
-            socklen_t client_len = sizeof(client_addr);
-
-            int received = recvfrom(m_socket, buffer.data(), buffer.size(), 0,
-                                    reinterpret_cast<sockaddr *>(&client_addr),
-                                    &client_len);
-
-            if (received > 0)
-            {
-                m_packets_in++;
-                m_bytes_in += received;
-                handleClientPacket(buffer.data(), received, client_addr);
-            }
-        }
-    }
-
-    void UDPForwarder::handleClientPacket(const char *data, size_t len,
-                                          const sockaddr_in &client_addr)
-    {
-        auto &log = Logger::instance();
-        std::string client_key = makeClientKey(client_addr);
-
-        std::shared_ptr<UDPSession> session;
-
-        {
-            std::lock_guard<std::mutex> lock(m_sessions_mutex);
-
-            auto it = m_sessions.find(client_key);
-            if (it == m_sessions.end())
-            {
-                // 创建新会话
-                session = std::make_shared<UDPSession>();
-                session->socket = NetworkUtils::createSocket(SOCK_DGRAM);
-
-                if (session->socket == INVALID_SOCK)
+                if (recv_len > 0)
                 {
-                    log.error("UDP", "创建会话socket失败");
-                    return;
-                }
+                    g_packets_in++;
+                    g_bytes_in += recv_len;
 
-                NetworkUtils::setBufferSize(session->socket, 1024 * 1024);
-                NetworkUtils::setTimeout(session->socket, m_config.udp_timeout);
-
-                session->client_addr = client_addr;
-                session->last_active = std::chrono::steady_clock::now();
-
-                m_sessions[client_key] = session;
-
-                log.info("UDP", "新会话: " + client_key);
-
-                // 启动接收线程
-                session->recv_thread = std::thread(&UDPForwarder::receiveFromTarget,
-                                                   this, client_key);
-            }
-            else
-            {
-                session = it->second;
-                session->last_active = std::chrono::steady_clock::now();
-            }
-        }
-
-        // 转发到目标服务器
-        sockaddr_in target_addr{};
-        target_addr.sin_family = AF_INET;
-        target_addr.sin_port = htons(m_config.target_port);
-        inet_pton(AF_INET, m_config.target_host.c_str(), &target_addr.sin_addr);
-
-        sendto(session->socket, data, len, 0,
-               reinterpret_cast<sockaddr *>(&target_addr), sizeof(target_addr));
-    }
-
-    void UDPForwarder::receiveFromTarget(const std::string &client_key)
-    {
-        auto &log = Logger::instance();
-        std::vector<char> buffer(m_config.buffer_size);
-
-        while (m_running && !g_shutdown_requested)
-        {
-            std::shared_ptr<UDPSession> session;
-
-            {
-                std::lock_guard<std::mutex> lock(m_sessions_mutex);
-                auto it = m_sessions.find(client_key);
-                if (it == m_sessions.end() || !it->second->running)
-                {
-                    break;
-                }
-                session = it->second;
-            }
-
-            sockaddr_in from_addr{};
-            socklen_t from_len = sizeof(from_addr);
-
-            int received = recvfrom(session->socket, buffer.data(), buffer.size(), 0,
-                                    reinterpret_cast<sockaddr *>(&from_addr), &from_len);
-
-            if (received > 0)
-            {
-                // 发送回客户端
-                sendto(m_socket, buffer.data(), received, 0,
-                       reinterpret_cast<sockaddr *>(&session->client_addr),
-                       sizeof(session->client_addr));
-
-                m_packets_out++;
-                m_bytes_out += received;
-
-                std::lock_guard<std::mutex> lock(m_sessions_mutex);
-                auto it = m_sessions.find(client_key);
-                if (it != m_sessions.end())
-                {
-                    it->second->last_active = std::chrono::steady_clock::now();
-                }
-            }
-            else if (received < 0)
-            {
-                // 检查超时
-#ifdef PLATFORM_WINDOWS
-                if (WSAGetLastError() == WSAETIMEDOUT)
-                {
-#else
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-#endif
-                    // 检查会话是否超时
-                    auto now = std::chrono::steady_clock::now();
-                    std::lock_guard<std::mutex> lock(m_sessions_mutex);
-                    auto it = m_sessions.find(client_key);
-                    if (it != m_sessions.end())
+                    auto session = get_or_create_session(client_addr);
+                    if (session)
                     {
-                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                                           now - it->second->last_active)
-                                           .count();
-                        if (elapsed > m_config.udp_timeout)
+                        ssize_t sent = send(session->server_socket,
+                                            buffer.data(), recv_len, 0);
+                        if (sent > 0)
                         {
-                            break;
+                            g_packets_out++;
+                            g_bytes_out += sent;
+                            session->packets_sent++;
+                            session->update_activity();
+
+                            Log::debug("UDP: " + addr_to_string(client_addr) +
+                                       " -> 服务器 (" + std::to_string(recv_len) + " bytes)");
                         }
                     }
-                    continue;
                 }
-                break;
             }
-        }
 
-        // 清理会话
-        {
-            std::lock_guard<std::mutex> lock(m_sessions_mutex);
-            auto it = m_sessions.find(client_key);
-            if (it != m_sessions.end())
+            // 2. 处理来自服务器的响应 -> 转发回对应客户端
+            for (auto &pair : active_sessions)
             {
-                it->second->running = false;
-                m_sessions.erase(it);
-                log.info("UDP", "会话结束: " + client_key);
+                if (pair.second->server_socket >= 0 &&
+                    FD_ISSET(pair.second->server_socket, &read_fds))
+                {
+
+                    ssize_t recv_len = recv(pair.second->server_socket,
+                                            buffer.data(), buffer.size(), 0);
+
+                    if (recv_len > 0)
+                    {
+                        g_packets_in++;
+                        g_bytes_in += recv_len;
+
+                        ssize_t sent = sendto(listen_socket_, buffer.data(), recv_len, 0,
+                                              (sockaddr *)&pair.second->client_addr,
+                                              sizeof(pair.second->client_addr));
+
+                        if (sent > 0)
+                        {
+                            g_packets_out++;
+                            g_bytes_out += sent;
+                            pair.second->packets_recv++;
+                            pair.second->update_activity();
+
+                            Log::debug("UDP: 服务器 -> " + pair.first +
+                                       " (" + std::to_string(recv_len) + " bytes)");
+                        }
+                    }
+                }
             }
         }
     }
 
-    void UDPForwarder::cleanupSessions()
+    // 清理过期会话
+    void cleanup_loop()
     {
-        while (m_running && !g_shutdown_requested)
+        while (running_ && g_running)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(30));
+            std::this_thread::sleep_for(std::chrono::seconds(5));
 
-            auto now = std::chrono::steady_clock::now();
             std::vector<std::string> expired;
 
             {
-                std::lock_guard<std::mutex> lock(m_sessions_mutex);
-                for (auto &pair : m_sessions)
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+
+                for (auto &pair : sessions_)
                 {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                                       now - pair.second->last_active)
-                                       .count();
-                    if (elapsed > m_config.udp_timeout)
+                    if (pair.second->inactive_seconds() > g_config.udp_timeout)
                     {
                         expired.push_back(pair.first);
                     }
                 }
-            }
 
-            for (const auto &key : expired)
-            {
-                std::lock_guard<std::mutex> lock(m_sessions_mutex);
-                auto it = m_sessions.find(key);
-                if (it != m_sessions.end())
+                for (const auto &key : expired)
                 {
-                    it->second->running = false;
-                    m_sessions.erase(it);
-                    Logger::instance().info("UDP", "清理超时会话: " + key);
+                    Log::info("UDP: 玩家超时断开 " + key);
+                    sessions_.erase(key);
+                    g_udp_sessions--;
                 }
             }
         }
     }
+};
 
-    void UDPForwarder::printStats()
+// ==================== TCP 连接 (每个玩家一个) ====================
+class TcpConnection : public std::enable_shared_from_this<TcpConnection>
+{
+public:
+    TcpConnection(int client_fd, const sockaddr_in &client_addr)
+        : client_fd_(client_fd), server_fd_(-1),
+          client_addr_(client_addr), running_(false) {}
+
+    ~TcpConnection() { stop(); }
+
+    bool start()
     {
-        auto formatBytes = [](uint64_t bytes) -> std::string
+        // 连接到目标服务器
+        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd_ < 0)
         {
-            const char *units[] = {"B", "KB", "MB", "GB"};
-            int unit_index = 0;
-            double size = static_cast<double>(bytes);
-
-            while (size >= 1024 && unit_index < 3)
-            {
-                size /= 1024;
-                unit_index++;
-            }
-
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(1) << size << units[unit_index];
-            return oss.str();
-        };
-
-        while (m_running && !g_shutdown_requested)
-        {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
-
-            size_t session_count;
-            {
-                std::lock_guard<std::mutex> lock(m_sessions_mutex);
-                session_count = m_sessions.size();
-            }
-
-            Logger::instance().info("UDP",
-                                    "统计 │ 活跃会话: " + std::to_string(session_count) +
-                                        " │ 入站: " + std::to_string(m_packets_in.load()) + "包/" + formatBytes(m_bytes_in) +
-                                        " │ 出站: " + std::to_string(m_packets_out.load()) + "包/" + formatBytes(m_bytes_out));
-        }
-    }
-
-    // ==================== ForwarderManager 实现 ====================
-
-    ForwarderManager::ForwarderManager(const Config &config)
-        : m_config(config)
-    {
-    }
-
-    ForwarderManager::~ForwarderManager()
-    {
-        stop();
-    }
-
-    void ForwarderManager::printBanner()
-    {
-        std::cout << R"(
-╔══════════════════════════════════════════════════════════════╗
-║              游戏服务器端口转发工具 v1.0 (C++)               ║
-║                    支持 TCP / UDP 协议                       ║
-╠══════════════════════════════════════════════════════════════╣
-║   用法: 客户端 → 本服务器 → 目标游戏服务器                   ║
-╚══════════════════════════════════════════════════════════════╝
-)" << std::endl;
-    }
-
-    bool ForwarderManager::start()
-    {
-        printBanner();
-
-        // 设置日志级别
-        Logger::instance().setLevel(m_config.log_level);
-
-        // 打印配置
-        m_config.print();
-
-        // 初始化网络
-        if (!NetworkUtils::initialize())
-        {
+            Log::error("TCP: 创建服务器socket失败");
             return false;
         }
 
-        m_running = true;
+        sockaddr_in target_addr{};
+        target_addr.sin_family = AF_INET;
+        target_addr.sin_port = htons(g_config.target_port);
 
-        // 启动TCP转发
-        if (m_config.enable_tcp)
+        if (!resolve_host(g_config.target_host, target_addr))
         {
-            m_tcp_forwarder = std::make_unique<TCPForwarder>(m_config);
-            if (!m_tcp_forwarder->start())
-            {
-                Logger::instance().error("MAIN", "TCP转发启动失败");
-            }
-        }
-
-        // 启动UDP转发
-        if (m_config.enable_udp)
-        {
-            m_udp_forwarder = std::make_unique<UDPForwarder>(m_config);
-            if (!m_udp_forwarder->start())
-            {
-                Logger::instance().error("MAIN", "UDP转发启动失败");
-            }
-        }
-
-        if (!m_tcp_forwarder && !m_udp_forwarder)
-        {
-            Logger::instance().error("MAIN", "没有成功启动的转发服务!");
+            Log::error("TCP: 无法解析目标地址");
+            close(server_fd_);
+            server_fd_ = -1;
             return false;
         }
 
-        Logger::instance().info("MAIN", "服务启动成功! 按 Ctrl+C 停止...");
+        if (connect(server_fd_, (sockaddr *)&target_addr, sizeof(target_addr)) < 0)
+        {
+            Log::error("TCP: 连接目标服务器失败 - " + std::string(strerror(errno)));
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
+
+        running_ = true;
+        g_tcp_connections++;
+
+        Log::info("TCP: 新玩家连接 " + addr_to_string(client_addr_) +
+                  " (在线: " + std::to_string(g_tcp_connections.load()) + ")");
 
         return true;
     }
 
-    void ForwarderManager::stop()
+    void run()
     {
-        if (!m_running)
-            return;
-        m_running = false;
+        std::vector<char> buffer(g_config.buffer_size);
 
-        if (m_tcp_forwarder)
+        while (running_ && g_running)
         {
-            m_tcp_forwarder->stop();
-            m_tcp_forwarder.reset();
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+
+            if (client_fd_ >= 0)
+                FD_SET(client_fd_, &read_fds);
+            if (server_fd_ >= 0)
+                FD_SET(server_fd_, &read_fds);
+
+            int max_fd = std::max(client_fd_, server_fd_);
+
+            timeval tv{1, 0};
+            int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+
+            if (ret < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+            if (ret == 0)
+                continue;
+
+            // 客户端 -> 服务器
+            if (client_fd_ >= 0 && FD_ISSET(client_fd_, &read_fds))
+            {
+                ssize_t len = recv(client_fd_, buffer.data(), buffer.size(), 0);
+                if (len <= 0)
+                    break;
+
+                g_packets_in++;
+                g_bytes_in += len;
+
+                ssize_t sent = send(server_fd_, buffer.data(), len, 0);
+                if (sent <= 0)
+                    break;
+
+                g_packets_out++;
+                g_bytes_out += sent;
+
+                Log::debug("TCP: " + addr_to_string(client_addr_) +
+                           " -> 服务器 (" + std::to_string(len) + " bytes)");
+            }
+
+            // 服务器 -> 客户端
+            if (server_fd_ >= 0 && FD_ISSET(server_fd_, &read_fds))
+            {
+                ssize_t len = recv(server_fd_, buffer.data(), buffer.size(), 0);
+                if (len <= 0)
+                    break;
+
+                g_packets_in++;
+                g_bytes_in += len;
+
+                ssize_t sent = send(client_fd_, buffer.data(), len, 0);
+                if (sent <= 0)
+                    break;
+
+                g_packets_out++;
+                g_bytes_out += sent;
+
+                Log::debug("TCP: 服务器 -> " + addr_to_string(client_addr_) +
+                           " (" + std::to_string(len) + " bytes)");
+            }
         }
 
-        if (m_udp_forwarder)
-        {
-            m_udp_forwarder->stop();
-            m_udp_forwarder.reset();
-        }
-
-        NetworkUtils::cleanup();
-        Logger::instance().info("MAIN", "所有服务已停止");
-    }
-
-    void ForwarderManager::waitForShutdown()
-    {
-        while (m_running && !g_shutdown_requested)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
         stop();
     }
 
-} // namespace PortForwarder
-
-// ==================== main 函数 ====================
-
-void printHelp(const char *prog)
-{
-    std::cout << "游戏服务器端口转发工具\n\n"
-              << "用法: " << prog << " [选项]\n\n"
-              << "选项:\n"
-              << "  -c, --config FILE    配置文件路径 (默认: config.json)\n"
-              << "  -l, --listen ADDR    监听地址 (格式: HOST:PORT)\n"
-              << "  -t, --target ADDR    目标地址 (格式: HOST:PORT)\n"
-              << "  --tcp                仅启用TCP转发\n"
-              << "  --udp                仅启用UDP转发\n"
-              << "  --init               生成默认配置文件\n"
-              << "  -v, --verbose        详细日志模式\n"
-              << "  -h, --help           显示帮助\n\n"
-              << "示例:\n"
-              << "  " << prog << "                              # 使用config.json\n"
-              << "  " << prog << " -l 0.0.0.0:54321 -t 1.2.3.4:19132\n"
-              << "  " << prog << " --udp                        # 仅UDP(MCBE推荐)\n";
-}
-
-bool parseAddress(const std::string &addr, std::string &host, int &port)
-{
-    size_t pos = addr.rfind(':');
-    if (pos == std::string::npos)
-        return false;
-    host = addr.substr(0, pos);
-    port = std::stoi(addr.substr(pos + 1));
-    return true;
-}
-
-int main(int argc, char *argv[])
-{
-    using namespace PortForwarder;
-
-    // 设置信号处理
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
-#ifdef PLATFORM_UNIX
-    signal(SIGHUP, signalHandler);
-#endif
-
-    Config config;
-    std::string config_path = "config.json";
-    bool init_mode = false;
-    bool tcp_only = false;
-    bool udp_only = false;
-    bool verbose = false;
-
-    // 解析命令行参数
-    for (int i = 1; i < argc; i++)
+    void stop()
     {
-        std::string arg = argv[i];
+        if (!running_.exchange(false))
+            return;
 
-        if (arg == "-h" || arg == "--help")
+        if (client_fd_ >= 0)
         {
-            printHelp(argv[0]);
-            return 0;
+            close(client_fd_);
+            client_fd_ = -1;
         }
-        else if (arg == "-c" || arg == "--config")
+        if (server_fd_ >= 0)
         {
-            if (i + 1 < argc)
-            {
-                config_path = argv[++i];
-            }
+            close(server_fd_);
+            server_fd_ = -1;
         }
-        else if (arg == "-l" || arg == "--listen")
-        {
-            if (i + 1 < argc)
-            {
-                if (!parseAddress(argv[++i], config.listen_host, config.listen_port))
-                {
-                    std::cerr << "错误: 监听地址格式无效\n";
-                    return 1;
-                }
-            }
-        }
-        else if (arg == "-t" || arg == "--target")
-        {
-            if (i + 1 < argc)
-            {
-                if (!parseAddress(argv[++i], config.target_host, config.target_port))
-                {
-                    std::cerr << "错误: 目标地址格式无效\n";
-                    return 1;
-                }
-            }
-        }
-        else if (arg == "--tcp")
-        {
-            tcp_only = true;
-        }
-        else if (arg == "--udp")
-        {
-            udp_only = true;
-        }
-        else if (arg == "--init")
-        {
-            init_mode = true;
-        }
-        else if (arg == "-v" || arg == "--verbose")
-        {
-            verbose = true;
-        }
+
+        g_tcp_connections--;
+        Log::info("TCP: 玩家断开 " + addr_to_string(client_addr_));
     }
 
-    // 初始化模式
-    if (init_mode)
+private:
+    int client_fd_;
+    int server_fd_;
+    sockaddr_in client_addr_;
+    std::atomic<bool> running_;
+};
+
+// ==================== TCP 转发器 ====================
+class TcpForwarder
+{
+public:
+    TcpForwarder() : listen_socket_(-1), running_(false) {}
+
+    ~TcpForwarder() { stop(); }
+
+    bool start()
     {
-        config.target_host = "目标服务器IP";
-        if (config.saveToFile(config_path))
+        listen_socket_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_socket_ < 0)
         {
-            std::cout << "✓ 配置文件已生成: " << config_path << "\n"
-                      << "  请编辑配置文件后重新运行程序\n";
-            return 0;
+            Log::error("TCP: 创建socket失败");
+            return false;
         }
-        else
+
+        int opt = 1;
+        setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in listen_addr{};
+        listen_addr.sin_family = AF_INET;
+        listen_addr.sin_port = htons(g_config.listen_port);
+
+        if (!resolve_host(g_config.listen_host, listen_addr))
         {
-            std::cerr << "错误: 无法创建配置文件\n";
+            Log::error("TCP: 无法解析监听地址");
+            close(listen_socket_);
+            return false;
+        }
+
+        if (bind(listen_socket_, (sockaddr *)&listen_addr, sizeof(listen_addr)) < 0)
+        {
+            Log::error("TCP: 绑定失败 - " + std::string(strerror(errno)));
+            close(listen_socket_);
+            return false;
+        }
+
+        if (listen(listen_socket_, 128) < 0)
+        {
+            Log::error("TCP: 监听失败");
+            close(listen_socket_);
+            return false;
+        }
+
+        set_nonblocking(listen_socket_);
+        running_ = true;
+
+        accept_thread_ = std::thread(&TcpForwarder::accept_loop, this);
+
+        Log::info("TCP: 转发器启动 " + g_config.listen_host + ":" +
+                  std::to_string(g_config.listen_port));
+
+        return true;
+    }
+
+    void stop()
+    {
+        running_ = false;
+
+        if (listen_socket_ >= 0)
+        {
+            close(listen_socket_);
+            listen_socket_ = -1;
+        }
+
+        if (accept_thread_.joinable() &&
+            accept_thread_.get_id() != std::this_thread::get_id())
+        {
+            accept_thread_.join();
+        }
+
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        for (auto &t : threads_)
+        {
+            if (t.joinable())
+                t.join();
+        }
+        threads_.clear();
+    }
+
+private:
+    int listen_socket_;
+    std::atomic<bool> running_;
+    std::thread accept_thread_;
+    std::mutex threads_mutex_;
+    std::vector<std::thread> threads_;
+
+    void accept_loop()
+    {
+        while (running_ && g_running)
+        {
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(listen_socket_, &read_fds);
+
+            timeval tv{1, 0};
+            if (select(listen_socket_ + 1, &read_fds, nullptr, nullptr, &tv) <= 0)
+            {
+                continue;
+            }
+
+            sockaddr_in client_addr{};
+            socklen_t addr_len = sizeof(client_addr);
+
+            int client_fd = accept(listen_socket_, (sockaddr *)&client_addr, &addr_len);
+            if (client_fd < 0)
+                continue;
+
+            auto conn = std::make_shared<TcpConnection>(client_fd, client_addr);
+            if (conn->start())
+            {
+                std::lock_guard<std::mutex> lock(threads_mutex_);
+                threads_.emplace_back([conn]()
+                                      { conn->run(); });
+            }
+            else
+            {
+                close(client_fd);
+            }
+        }
+    }
+};
+
+// ==================== 状态监控 ====================
+void status_monitor(UdpForwarder *udp)
+{
+    while (g_running)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+
+        if (!g_running)
+            break;
+
+        std::cout << "\n";
+        std::cout << "╔══════════════════════════════════════════════╗\n";
+        std::cout << "║              运 行 状 态                     ║\n";
+        std::cout << "╠══════════════════════════════════════════════╣\n";
+        std::cout << "║ UDP会话: " << std::setw(8) << g_udp_sessions.load()
+                  << " | TCP连接: " << std::setw(8) << g_tcp_connections.load() << "    ║\n";
+        std::cout << "║ 收包数:  " << std::setw(8) << g_packets_in.load()
+                  << " | 发包数:  " << std::setw(8) << g_packets_out.load() << "    ║\n";
+        std::cout << "║ 接收:    " << std::setw(12) << format_bytes(g_bytes_in.load())
+                  << " | 发送:    " << std::setw(12) << format_bytes(g_bytes_out.load()) << "║\n";
+        std::cout << "╠══════════════════════════════════════════════╣\n";
+        std::cout << "║ 活动玩家:                                    ║\n";
+
+        if (udp)
+        {
+            udp->print_sessions();
+        }
+
+        std::cout << "╚══════════════════════════════════════════════╝\n";
+    }
+}
+
+// ==================== 主函数 ====================
+int main(int argc, char *argv[])
+{
+    std::cout << R"(
+   ██╗██████╗     ███████╗ ██████╗ ██████╗ ██╗    ██╗ █████╗ ██████╗ ██████╗ 
+   ██║██╔══██╗    ██╔════╝██╔═══██╗██╔══██╗██║    ██║██╔══██╗██╔══██╗██╔══██╗
+   ██║██████╔╝    █████╗  ██║   ██║██████╔╝██║ █╗ ██║███████║██████╔╝██║  ██║
+   ██║██╔═══╝     ██╔══╝  ██║   ██║██╔══██╗██║███╗██║██╔══██║██╔══██╗██║  ██║
+   ██║██║         ██║     ╚██████╔╝██║  ██║╚███╔███╔╝██║  ██║██║  ██║██████╔╝
+   ╚═╝╚═╝         ╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ 
+                      游戏服务器转发工具 v3.0 (多玩家支持)
+)" << std::endl;
+
+    // 信号处理
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    // 配置文件
+    std::string config_file = "config.json";
+    if (argc > 1)
+    {
+        config_file = argv[1];
+    }
+
+    // 检查配置文件
+    std::ifstream check(config_file);
+    if (!check.good())
+    {
+        Log::info("创建默认配置文件: " + config_file);
+        g_config.create_default(config_file);
+    }
+    check.close();
+
+    if (!g_config.load(config_file))
+    {
+        Log::warn("使用默认配置");
+    }
+
+    g_config.print();
+
+    // 启动转发器
+    std::unique_ptr<UdpForwarder> udp_forwarder;
+    std::unique_ptr<TcpForwarder> tcp_forwarder;
+
+    if (g_config.enable_udp)
+    {
+        udp_forwarder = std::make_unique<UdpForwarder>();
+        if (!udp_forwarder->start())
+        {
+            Log::error("UDP转发器启动失败!");
             return 1;
         }
     }
 
-    // 加载配置文件
-    if (!config.loadFromFile(config_path))
+    if (g_config.enable_tcp)
     {
-        std::cout << "未找到配置文件，使用默认配置\n";
+        tcp_forwarder = std::make_unique<TcpForwarder>();
+        if (!tcp_forwarder->start())
+        {
+            Log::error("TCP转发器启动失败!");
+            return 1;
+        }
     }
 
-    // 应用命令行选项
-    if (tcp_only)
+    // 状态监控线程
+    std::thread monitor_thread(status_monitor, udp_forwarder.get());
+
+    std::cout << "\n";
+    Log::info("服务已启动，按 Ctrl+C 停止");
+    std::cout << "\n";
+    std::cout << "┌──────────────────────────────────────────────────────────┐\n";
+    std::cout << "│                       转发规则                           │\n";
+    std::cout << "├──────────────────────────────────────────────────────────┤\n";
+    std::cout << "│  多个玩家 ──► " << g_config.listen_host << ":"
+              << g_config.listen_port << " ──► "
+              << g_config.target_host << ":" << g_config.target_port << "\n";
+    std::cout << "│                                                          │\n";
+    std::cout << "│  Player1 (独立会话) ──┐                                  │\n";
+    std::cout << "│  Player2 (独立会话) ──┼──► 中转服务器 ──► 目标服务器     │\n";
+    std::cout << "│  Player3 (独立会话) ──┘                                  │\n";
+    std::cout << "└──────────────────────────────────────────────────────────┘\n";
+
+    // 主循环
+    while (g_running)
     {
-        config.enable_tcp = true;
-        config.enable_udp = false;
-    }
-    if (udp_only)
-    {
-        config.enable_tcp = false;
-        config.enable_udp = true;
-    }
-    if (verbose)
-    {
-        config.log_level = LogLevel::DEBUG;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // 启动转发器
-    ForwarderManager manager(config);
+    std::cout << "\n";
+    Log::info("正在停止服务...");
 
-    if (!manager.start())
+    if (udp_forwarder)
+        udp_forwarder->stop();
+    if (tcp_forwarder)
+        tcp_forwarder->stop();
+
+    if (monitor_thread.joinable())
     {
-        return 1;
+        monitor_thread.join();
     }
 
-    manager.waitForShutdown();
+    // 最终统计
+    std::cout << "\n";
+    std::cout << "╔══════════════════════════════════════════════╗\n";
+    std::cout << "║              最 终 统 计                     ║\n";
+    std::cout << "╠══════════════════════════════════════════════╣\n";
+    std::cout << "║ 总收包: " << std::setw(15) << g_packets_in.load()
+              << "                 ║\n";
+    std::cout << "║ 总发包: " << std::setw(15) << g_packets_out.load()
+              << "                 ║\n";
+    std::cout << "║ 总接收: " << std::setw(15) << format_bytes(g_bytes_in.load())
+              << "               ║\n";
+    std::cout << "║ 总发送: " << std::setw(15) << format_bytes(g_bytes_out.load())
+              << "               ║\n";
+    std::cout << "╚══════════════════════════════════════════════╝\n";
 
+    Log::info("程序已退出");
     return 0;
 }
