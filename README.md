@@ -21,24 +21,24 @@ A high-performance game server proxy for Minecraft Bedrock Edition and other UDP
 ./build.sh
 
 # Run (creates default config)
-./forwarder
+./MCBE_forwarder
 
 # Edit config
 nano config.json
 
 # Run as daemon
-./forwarder -d
+./MCBE_forwarder -d
 ```
 
 ## Usage
 
 ```bash
-./forwarder              # Run in foreground
-./forwarder -d           # Run as daemon
-./forwarder -s           # Stop daemon
-./forwarder -c <file>    # Custom config
-./forwarder -g           # Generate systemd service
-./forwarder -h           # Show help
+./MCBE_forwarder              # Run in foreground
+./MCBE_forwarder -d           # Run as daemon
+./MCBE_forwarder -s           # Stop daemon
+./MCBE_forwarder -c <file>    # Custom config
+./MCBE_forwarder -g           # Generate systemd service
+./MCBE_forwarder -h           # Show help
 ```
 
 ## Configuration
@@ -103,7 +103,7 @@ nano config.json
 
 ```bash
 # Generate & install
-./forwarder -g
+./MCBE_forwarder -g
 sudo cp ip_forward.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ip_forward

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# build.sh - Build script for C++17 forwarder application
-# Build command: g++ -std=c++17 -O2 -pthread main.cpp -o forwarder
+# build.sh - Build script for C++17 MCBE_forwarder application
+# Build command: g++ -std=c++17 -O2 -pthread main.cpp -o MCBE_forwarder
 
 set -e  # Exit on error
 
@@ -16,7 +16,7 @@ COMPILER="g++"
 CXX_STANDARD="c++17"
 OPTIMIZATION_LEVEL="-O2"
 THREAD_FLAG="-pthread"
-OUTPUT_NAME="forwarder"
+OUTPUT_NAME="MCBE_forwarder"
 SOURCE_FILE="main.cpp"
 REPO_URL=""  # Add your git repository URL here if needed
 
